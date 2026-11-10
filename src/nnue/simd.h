@@ -2,7 +2,7 @@
 #define SIMD_H
 
 // Defines a standard API for SIMD instructions.
-// Currently implemented for AVX2 and AVX512, with a scalar fallback.
+// Implemented for AVX-512, AVX2, ARM NEON, and a scalar fallback.
 // VEPI - vector of extended packed integer
 
 #include <cstdint>
@@ -29,6 +29,44 @@ inline vepi16 vecSet1(int16_t x) noexcept { return _mm512_set1_epi16(x); }
 inline vepi32 vecZero32() noexcept { return _mm512_setzero_si512(); }
 
 inline int32_t vecReduce(vepi32 v) noexcept { return _mm512_reduce_add_epi32(v); }
+
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+using vepi16 = int16x8_t;
+using vepi32 = int32x4_t;
+constexpr int VEC_I16 = 8;
+
+// AArch64 Advanced SIMD (NEON): 8x int16 lanes and 4x int32 lanes.
+inline vepi16 vecLoad(const int16_t* p) noexcept { return vld1q_s16(p); }
+inline void vecStore(int16_t* p, vepi16 v) noexcept { vst1q_s16(p, v); }
+
+inline vepi16 vecAdd(vepi16 a, vepi16 b) noexcept { return vaddq_s16(a, b); }
+inline vepi16 vecSub(vepi16 a, vepi16 b) noexcept { return vsubq_s16(a, b); }
+inline vepi16 vecMin(vepi16 a, vepi16 b) noexcept { return vminq_s16(a, b); }
+inline vepi16 vecMax(vepi16 a, vepi16 b) noexcept { return vmaxq_s16(a, b); }
+inline vepi16 vecMullo(vepi16 a, vepi16 b) noexcept { return vmulq_s16(a, b); }
+
+// Match x86 pmaddwd semantics: multiply signed 16-bit lanes into 32-bit
+// products, then sum adjacent products into four signed 32-bit lanes.
+inline vepi32 vecMAdd(vepi16 a, vepi16 b) noexcept {
+    const int32x4_t lo = vmull_s16(vget_low_s16(a), vget_low_s16(b));
+    const int32x4_t hi = vmull_s16(vget_high_s16(a), vget_high_s16(b));
+    return vpaddq_s32(lo, hi);
+}
+inline vepi32 vecAdd32(vepi32 a, vepi32 b) noexcept { return vaddq_s32(a, b); }
+
+inline vepi16 vecSet1(int16_t x) noexcept { return vdupq_n_s16(x); }
+inline vepi32 vecZero32() noexcept { return vdupq_n_s32(0); }
+
+inline int32_t vecReduce(vepi32 v) noexcept {
+#if defined(__aarch64__)
+    return vaddvq_s32(v);
+#else
+    int32x2_t sum = vadd_s32(vget_low_s32(v), vget_high_s32(v));
+    sum = vpadd_s32(sum, sum);
+    return vget_lane_s32(sum, 0);
+#endif
+}
 
 #elif defined(__AVX2__)
 #include <immintrin.h>
