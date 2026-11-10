@@ -1,0 +1,118 @@
+name: Android ARM64 NEON
+
+on:
+  workflow_dispatch:
+    inputs:
+      uci_date:
+        description: "UCI build identity date (YYYYMMDD)"
+        required: true
+        default: "20261110"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Onslaught ARM64 NEON (API 24)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Validate build date
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        run: |
+          set -euo pipefail
+          [[ "$UCI_DATE" =~ ^[0-9]{8}$ ]] || { echo "uci_date must use YYYYMMDD" >&2; exit 1; }
+          date -u -d "${UCI_DATE:0:4}-${UCI_DATE:4:2}-${UCI_DATE:6:2}" '+%Y%m%d' >/dev/null
+          echo "UCI build date: $UCI_DATE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Android NDK r27c
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r27c-linux.zip \
+            -o "$RUNNER_TEMP/android-ndk-r27c.zip"
+          unzip -q "$RUNNER_TEMP/android-ndk-r27c.zip" -d "$RUNNER_TEMP"
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: Fetch the source-matched NNUE
+        shell: bash
+        run: |
+          set -euo pipefail
+          NNUE_FILE="nn-abd46cb3aae8e9ac-v2.nnue"
+          NNUE_COMMIT="a36b21ab2809cdcc79401a84520ba9937a16229d"
+          NNUE_URL="https://raw.githubusercontent.com/kachhy/Onslaught/${NNUE_COMMIT}/${NNUE_FILE}"
+          curl --fail --location --retry 3 "$NNUE_URL" -o "$NNUE_FILE"
+          test -s "$NNUE_FILE"
+          NNUE_BYTES=$(stat -c '%s' "$NNUE_FILE")
+          # 768 x 1024 x 4 int16 feature weights, 1024 biases,
+          # 8 x 2048 int16 output weights, and 8 int16 output biases.
+          if [[ "$NNUE_BYTES" != 6326288 && "$NNUE_BYTES" != 6326336 ]]; then
+            echo "Unexpected NNUE size: ${NNUE_BYTES} bytes (expected 6326288 or 6326336)" >&2
+            exit 1
+          fi
+          echo "NNUE: $NNUE_FILE ($NNUE_BYTES bytes; architecture-size check passed)" >> "$GITHUB_STEP_SUMMARY"
+          sha256sum "$NNUE_FILE" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify NDK NEON and DotProd compiler support
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          NDK_CXX="$NDK_BIN/aarch64-linux-android24-clang++"
+          NEON_MACROS=$(printf '\n' | "$NDK_CXX" -march=armv8-a+simd -dM -E -x c++ -)
+          grep -q '^#define __aarch64__' <<<"$NEON_MACROS"
+          grep -q '^#define __ARM_NEON' <<<"$NEON_MACROS"
+          echo "PASS: NDK compiler targets AArch64 + NEON."
+          bash scripts/verify-android-dotprod-toolchain.sh \
+            "$NDK_CXX" "$NDK_BIN/llvm-objdump"
+
+      - name: Build Android ARM64 NEON
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME
+          export ANDROID_API=24
+          export ANDROID_CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          export ANDROID_EXE="$GITHUB_WORKSPACE/dist/Onslaught-2.1-android-arm64-neon"
+          make clean
+          make -j2 android-neon VERSION=2.1 UCI_DATE="$UCI_DATE" \
+            ANDROID_API=24 ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
+            ANDROID_CXX="$ANDROID_CXX" ANDROID_EXE="$ANDROID_EXE"
+
+      - name: Verify Android ELF and NEON instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          bash scripts/verify-android-neon.sh \
+            dist/Onslaught-2.1-android-arm64-neon \
+            "$LLVM_BIN/llvm-readelf" "$LLVM_BIN/llvm-objdump"
+
+      - name: Record build metadata
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        run: |
+          {
+            echo "### Onslaught Android build"
+            echo "- Engine: Onslaught 2.1"
+            echo "- UCI build date: $UCI_DATE"
+            echo "- Target: AArch64 Android API 24"
+            echo "- SIMD: ARM NEON (ARMv8-A+SIMD)"
+            echo "- DotProd: not enabled as an engine kernel; current int16/screlu NNUE has no suitable exact SDOT path"
+            echo "- Source commit: $GITHUB_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload engine-only artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Onslaught-2.1-Android-ARM64-NEON
+          path: dist/Onslaught-2.1-android-arm64-neon
+          if-no-files-found: error
+          retention-days: 30
