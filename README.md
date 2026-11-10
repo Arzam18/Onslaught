@@ -50,7 +50,7 @@ Follow these steps to build and run the Onslaught chess engine.
 
 | Version | Rating (CCRL 40/15) | Rating (Estimated)* | Rating (HCE Estimated)* |
 | :--- | :---: | :---: | :---: |
-| 2.1 |  3476  | 3474 |  --  |
+| 2.1 |  --  | 3474 |  --  |
 | 2.0 |  3370  | 3450 |  --  |
 | 1.0 | 3042 | 3119 | 2854 |
 
@@ -80,3 +80,27 @@ Running all of these SPRT tests takes a lot of compute. To contribute compute to
 - [OpenBench](https://github.com/AndyGrant/OpenBench) - the SPRT testing framework we rely on for all our testing.
 - [Incbin](https://github.com/graphitemaster/incbin) - used to embed our networks directly into our binaries.
 - [CodeMonkeyKing's YouTube series](https://www.youtube.com/watch?v=QUNP-UjujBM&list=PLmN0neTso3Jxh8ZIylk74JpwfiWNI76Cs) - a great starting point for learning chess engine implementation.
+
+## Android ARM64 build
+
+The repository includes an Android NDK build target for 64-bit ARM devices. It
+uses the ARMv8-A NEON baseline and keeps the existing NNUE quantization and
+search code unchanged:
+
+```bash
+make android-neon \
+  ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
+  ANDROID_API=24 \
+  UCI_DATE=YYYYMMDD
+```
+
+The generated executable is written to `dist/`. The GitHub Actions workflow
+`Android ARM64 NEON` downloads the network matching this source revision,
+builds the engine for Android API 24, and checks the ELF and disassembly.
+
+A separate SDOT/UDOT engine build is not provided. Onslaught's current NNUE
+uses signed 16-bit weights and a squared clipped-ReLU output path, rather than
+an 8-bit dot-product layer. Enabling `+dotprod` in the compiler would only make
+those instructions available to the compiler; it would not make the current
+inference kernel use them. The Android build therefore remains a genuine NEON
+build without claiming an unmeasured DotProd acceleration.

@@ -1,9 +1,23 @@
 CXX ?= g++
+.DEFAULT_GOAL := release
 CXXFLAGS=-Wall -MMD -MP -Wno-switch -Isrc -std=c++17 -DSPSA_TUNE
 LDFLAGS=
 EVALFILE=nn-abd46cb3aae8e9ac-v2.nnue
 
-CXXFLAGS += -DEVALFILE='"$(EVALFILE)"'
+# Embed the network when it is present. This also permits source-only builds
+# (for example, perft/syntax checks) without silently embedding a missing file.
+ifneq ($(wildcard $(EVALFILE)),)
+    CXXFLAGS += -DEVALFILE='"$(EVALFILE)"'
+else
+    $(info NNUE file '$(EVALFILE)' not found; building with runtime NNUE loading/HCE fallback)
+endif
+
+UCI_DATE ?=
+ifneq ($(strip $(UCI_DATE)),)
+    CXXFLAGS += -DUCI_BUILD_DATE='"$(UCI_DATE)"'
+endif
+CXXFLAGS += $(EXTRA_CXXFLAGS)
+LDFLAGS += $(EXTRA_LDFLAGS)
 
 OBJDIR=build
 SRC=$(shell find src -name '*.cpp')
@@ -98,6 +112,20 @@ endif
     EXE := $(DISTDIR)/Onslaught-$(VERSION)-$(PLATFORM)-x86-64$(ARCH_SUFFIX)$(EXE_EXT)
 endif
 
+# Android ARM64 release (NEON baseline). DotProd is intentionally not exposed
+# as an engine variant: the current NNUE uses int16 weights and squared clipped
+# activations, so its hot path has no exact/efficient int8 dot-product kernel.
+ANDROID_API ?= 24
+ANDROID_NDK_HOME ?= $(ANDROID_NDK_LATEST_HOME)
+ANDROID_CXX ?= $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$(ANDROID_API)-clang++
+ANDROID_EXE ?= $(DISTDIR)/Onslaught-$(VERSION)-android-arm64-neon
+
+android-neon:
+	@test -x "$(ANDROID_CXX)" || { echo "Android compiler not found: $(ANDROID_CXX)" >&2; exit 1; }
+	@$(MAKE) --no-print-directory release CXX="$(ANDROID_CXX)" UCI_DATE="$(UCI_DATE)" \
+		EXTRA_CXXFLAGS="-O3 -flto -march=armv8-a+simd -mtune=cortex-a76" \
+		EXTRA_LDFLAGS="-flto -static-libstdc++" EXE="$(ANDROID_EXE)"
+
 OBJ=$(patsubst src/%.cpp,$(OBJDIR)/%.o,$(SRC))
 C_OBJ=$(patsubst src/%.c,$(OBJDIR)/%.o,$(C_SRC))
 DEPS=$(OBJ:.o=.d) $(C_OBJ:.o=.d)
@@ -143,5 +171,5 @@ $(OBJDIR)/%.o: src/%.c
 clean:
 	rm -rf $(OBJDIR)
 
-.PHONY: all clean debug release releases variant $(RELEASE_TARGETS)
+.PHONY: all clean debug release releases variant android-neon $(RELEASE_TARGETS)
 -include $(DEPS)
