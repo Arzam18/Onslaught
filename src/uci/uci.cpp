@@ -257,7 +257,11 @@ int uciStartup() {
 
     initOptions();
 
-    std::cout << "id name Onslaught " << version << "\n";
+    std::cout << "id name Onslaught " << version;
+#ifdef UCI_BUILD_DATE
+    std::cout << " " << UCI_BUILD_DATE;
+#endif
+    std::cout << "\n";
     std::cout << "id author Connor Kostiew, Kai Chung, Will Bradley\n";
     options();
     std::cout << "uciok\n";
