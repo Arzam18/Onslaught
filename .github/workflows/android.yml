@@ -132,10 +132,6 @@ jobs:
 
           NNUE_BYTES="$(stat -c '%s' "$NNUE_FILE")"
 
-          # Network architecture:
-          # 768 x 1024 x 4 int16 feature weights,
-          # 1024 biases, 8 x 2048 output weights,
-          # and 8 output biases.
           if [[ "$NNUE_BYTES" != "6326288" && "$NNUE_BYTES" != "6326336" ]]; then
             echo "ERROR: Unexpected NNUE size: ${NNUE_BYTES} bytes."
             echo "Expected 6326288 or 6326336 bytes."
@@ -193,7 +189,6 @@ jobs:
           inline vepi16 vecMax(vepi16 a, vepi16 b) noexcept { return vmaxq_s16(a, b); }
           inline vepi16 vecMullo(vepi16 a, vepi16 b) noexcept { return vmulq_s16(a, b); }
 
-          // Match x86 pmaddwd semantics.
           inline vepi32 vecMAdd(vepi16 a, vepi16 b) noexcept {
               const int32x4_t lo = vmull_s16(vget_low_s16(a), vget_low_s16(b));
               const int32x4_t hi = vmull_s16(vget_high_s16(a), vget_high_s16(b));
@@ -277,6 +272,78 @@ jobs:
 
           git diff -- src/uci/uci.cpp
 
+      - name: Fix Makefile compiler and linker flag passthrough
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("Makefile")
+          text = path.read_text(encoding="utf-8")
+
+          cxx_passthrough = "CXXFLAGS += $(EXTRA_CXXFLAGS)"
+          ld_passthrough = "LDFLAGS += $(EXTRA_LDFLAGS)"
+
+          anchor = 'CXXFLAGS += -DEVALFILE='
+          lines = text.splitlines()
+
+          anchor_indices = [
+              i for i, line in enumerate(lines)
+              if line.startswith(anchor)
+          ]
+
+          if len(anchor_indices) != 1:
+              raise SystemExit(
+                  "ERROR: Expected EVALFILE CXXFLAGS line not found exactly once."
+              )
+
+          insert_at = anchor_indices[0] + 1
+
+          additions = []
+
+          if cxx_passthrough not in lines:
+              additions.append(cxx_passthrough)
+
+          if ld_passthrough not in lines:
+              additions.append(ld_passthrough)
+
+          for offset, addition in enumerate(additions):
+              lines.insert(insert_at + offset, addition)
+
+          text = "\n".join(lines) + "\n"
+
+          old_link = "\t@$(CXX) $(LDFLAGS) $^ -o $@"
+          new_link = (
+              '\t@echo "LINK_FLAGS: $(LDFLAGS)"\n'
+              + old_link
+          )
+
+          if old_link not in text:
+              raise SystemExit(
+                  "ERROR: Expected Makefile link command was not found."
+              )
+
+          if 'echo "LINK_FLAGS: $(LDFLAGS)"' not in text:
+              text = text.replace(old_link, new_link, 1)
+
+          if cxx_passthrough not in text:
+              raise SystemExit("ERROR: CXXFLAGS passthrough was not installed.")
+
+          if ld_passthrough not in text:
+              raise SystemExit("ERROR: LDFLAGS passthrough was not installed.")
+
+          path.write_text(text, encoding="utf-8")
+
+          print("Makefile now forwards EXTRA_CXXFLAGS.")
+          print("Makefile now forwards EXTRA_LDFLAGS.")
+          print("Link command now prints its actual linker flags.")
+          PY
+
+          echo "===== Temporary Makefile changes ====="
+          git diff -- Makefile
+
       - name: Verify Android NEON compiler support
         shell: bash
         run: |
@@ -341,6 +408,7 @@ jobs:
           set -euo pipefail
 
           ENGINE_BIN="dist/Onslaught-2.1-android-arm64-neon"
+          BUILD_LOG="dist/build.log"
 
           mkdir -p dist
 
@@ -351,15 +419,23 @@ jobs:
             CXX="$ANDROID_CXX" \
             EVALFILE="$NNUE_FILE" \
             EXE="$ENGINE_BIN" \
+            UCI_DATE="$UCI_DATE" \
             EXTRA_CXXFLAGS="-O3 -flto -march=armv8-a+simd -mtune=cortex-a76" \
-            EXTRA_LDFLAGS="-flto -static-libstdc++"
+            EXTRA_LDFLAGS="-flto -static-libstdc++" \
+            2>&1 | tee "$BUILD_LOG"
 
           test -s "$ENGINE_BIN"
 
-          echo "Build completed: $ENGINE_BIN"
+          echo "===== Verify actual link flags ====="
+
+          grep -Fq 'LINK_FLAGS: -flto -static-libstdc++' "$BUILD_LOG"
+
+          echo "PASS: -static-libstdc++ reached the final link command."
+
+          echo "===== Built engine ====="
           ls -lh "$ENGINE_BIN"
 
-      - name: Verify Android ARM64 ELF
+      - name: Verify Android ARM64 ELF and static C++ runtime
         shell: bash
         run: |
           set -euo pipefail
@@ -372,16 +448,17 @@ jobs:
           echo "===== Binary information ====="
           file "$BIN"
 
-          "$READELF" -h "$BIN" > elf-header.txt
-          "$READELF" -l "$BIN" > elf-program-headers.txt
+          "$READELF" -h "$BIN" > dist/elf-header.txt
+          "$READELF" -l "$BIN" > dist/elf-program-headers.txt
+          "$READELF" -d "$BIN" > dist/elf-dynamic.txt
 
-          grep -q 'Class:.*ELF64' elf-header.txt
-          grep -q 'Machine:.*AArch64' elf-header.txt
-          grep -Fq '/system/bin/linker64' elf-program-headers.txt
+          grep -q 'Class:.*ELF64' dist/elf-header.txt
+          grep -q 'Machine:.*AArch64' dist/elf-header.txt
+          grep -Fq '/system/bin/linker64' dist/elf-program-headers.txt
 
-          if "$READELF" -d "$BIN" 2>/dev/null |
-            grep -Fq 'libc++_shared.so'; then
-            echo "ERROR: Unexpected libc++_shared.so dependency."
+          if grep -Fq 'libc++_shared.so' dist/elf-dynamic.txt; then
+            echo "ERROR: Binary still depends on libc++_shared.so."
+            grep -F 'libc++_shared.so' dist/elf-dynamic.txt
             exit 1
           fi
 
@@ -422,7 +499,7 @@ jobs:
             '\b(add|sub|smin|smax|mul|smull|saddp)[[:space:]]+v[0-9]+\.' \
             "$DISASSEMBLY" || true
 
-      - name: Verify embedded UCI build identity
+      - name: Verify UCI build identity
         shell: bash
         env:
           UCI_DATE: ${{ inputs.uci_date }}
@@ -470,6 +547,8 @@ jobs:
           NDK: ${NDK_VERSION} (${NDK_REVISION})
           Architecture: ARMv8-A NEON
           Compiler flags: -march=armv8-a+simd -mtune=cortex-a76
+          Linker flags: -flto -static-libstdc++
+          C++ runtime: static libc++
           NNUE: ${NNUE_FILE}
           NNUE URL: ${NETWORK_URL}
           NEON implementation: AArch64 Advanced SIMD intrinsics
@@ -487,6 +566,7 @@ jobs:
             echo "- Engine: Onslaught ${ENGINE_VERSION}"
             echo "- UCI date: ${UCI_DATE}"
             echo "- Architecture: ARM64 NEON"
+            echo "- C++ runtime: static libc++"
             echo "- NNUE: ${NNUE_FILE}"
             echo "- Artifact: Onslaught-2.1-Android-ARM64-NEON"
           } >> "$GITHUB_STEP_SUMMARY"
