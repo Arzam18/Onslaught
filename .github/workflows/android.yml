@@ -1,0 +1,501 @@
+
+name: Onslaught Android ARM64 NEON
+
+on:
+  workflow_dispatch:
+    inputs:
+      uci_date:
+        description: "UCI build identity date (YYYYMMDD)"
+        required: true
+        default: "20261126"
+        type: string
+
+      network_url:
+        description: "Source-matched Onslaught NNUE download URL"
+        required: true
+        default: "https://raw.githubusercontent.com/kachhy/Onslaught/7da5ec6fc2db340f8954e910871fb78baadf97f0/nn-434b2a78950525ce-v2.nnue"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Onslaught 2.1 ARM64 NEON
+    runs-on: ubuntu-24.04
+
+    env:
+      ANDROID_API: "24"
+      NDK_VERSION: "r27c"
+      NDK_REVISION: "27.2.12479018"
+      NDK_SHA1: "090e8083a715fdb1a3e402d0763c388abb03fb4e"
+      ENGINE_VERSION: "2.1"
+      NNUE_FILE: "nn-434b2a78950525ce-v2.nnue"
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Validate manual build inputs
+        shell: bash
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        run: |
+          set -euo pipefail
+
+          [[ "$UCI_DATE" =~ ^[0-9]{8}$ ]] || {
+            echo "ERROR: uci_date must use YYYYMMDD."
+            exit 1
+          }
+
+          date -u -d \
+            "${UCI_DATE:0:4}-${UCI_DATE:4:2}-${UCI_DATE:6:2}" \
+            '+%Y%m%d' >/dev/null
+
+          grep -Fq 'constexpr std::string_view version = "2.1";' src/uci/uci.h
+          grep -Fq 'EVALFILE=nn-434b2a78950525ce-v2.nnue' Makefile
+
+          {
+            echo "### Onslaught Android build"
+            echo "- Engine: Onslaught ${ENGINE_VERSION}"
+            echo "- UCI build date: ${UCI_DATE}"
+            echo "- Target: Android ARM64"
+            echo "- Android API: ${ANDROID_API}"
+            echo "- Architecture: ARMv8-A NEON"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            make \
+            unzip \
+            curl \
+            file \
+            binutils \
+            python3
+
+      - name: Install Android NDK r27c
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK_ARCHIVE="$RUNNER_TEMP/android-ndk-r27c-linux.zip"
+          NDK_URL="https://dl.google.com/android/repository/android-ndk-r27c-linux.zip"
+
+          curl -fL --retry 3 --retry-delay 2 \
+            "$NDK_URL" \
+            -o "$NDK_ARCHIVE"
+
+          echo "${NDK_SHA1}  ${NDK_ARCHIVE}" | sha1sum --check -
+
+          mkdir -p "$RUNNER_TEMP/android-ndk"
+          unzip -q "$NDK_ARCHIVE" -d "$RUNNER_TEMP/android-ndk"
+
+          NDK_PATH="$RUNNER_TEMP/android-ndk/android-ndk-r27c"
+          NDK_BIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          ANDROID_CXX="$NDK_BIN/aarch64-linux-android24-clang++"
+
+          test -x "$ANDROID_CXX"
+          test -x "$NDK_BIN/llvm-objdump"
+          test -x "$NDK_BIN/llvm-readelf"
+
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_CXX=$ANDROID_CXX" >> "$GITHUB_ENV"
+          echo "NDK_BIN=$NDK_BIN" >> "$GITHUB_ENV"
+
+          echo "$NDK_BIN" >> "$GITHUB_PATH"
+
+          echo "Android NDK r27c installed."
+          "$NDK_PATH/ndk-build" --version
+
+      - name: Download source-matched NNUE
+        shell: bash
+        env:
+          NETWORK_URL: ${{ inputs.network_url }}
+        run: |
+          set -euo pipefail
+
+          test -n "$NETWORK_URL"
+
+          curl -fL --retry 3 --retry-delay 2 \
+            "$NETWORK_URL" \
+            -o "$NNUE_FILE"
+
+          test -s "$NNUE_FILE"
+
+          NNUE_BYTES="$(stat -c '%s' "$NNUE_FILE")"
+
+          # Network architecture:
+          # 768 x 1024 x 4 int16 feature weights,
+          # 1024 biases, 8 x 2048 output weights,
+          # and 8 output biases.
+          if [[ "$NNUE_BYTES" != "6326288" && "$NNUE_BYTES" != "6326336" ]]; then
+            echo "ERROR: Unexpected NNUE size: ${NNUE_BYTES} bytes."
+            echo "Expected 6326288 or 6326336 bytes."
+            exit 1
+          fi
+
+          echo "NNUE file: $NNUE_FILE"
+          echo "NNUE size: $NNUE_BYTES bytes"
+
+          sha256sum "$NNUE_FILE" | tee network.sha256
+
+          {
+            echo "- NNUE: ${NNUE_FILE}"
+            echo "- NNUE size: ${NNUE_BYTES} bytes"
+            echo '```'
+            cat network.sha256
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore ARM64 NEON NNUE implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("src/nnue/simd.h")
+          text = path.read_text(encoding="utf-8")
+
+          if "AArch64 Advanced SIMD (NEON)" in text:
+              print("NEON implementation already exists.")
+          else:
+              marker = "#elif defined(__AVX2__)"
+
+              if text.count(marker) != 1:
+                  raise SystemExit(
+                      "ERROR: Could not find the expected AVX2 insertion point."
+                  )
+
+              neon_block = r"""
+          #elif defined(__aarch64__) || defined(__ARM_NEON)
+          #include <arm_neon.h>
+          using vepi16 = int16x8_t;
+          using vepi32 = int32x4_t;
+          constexpr int VEC_I16 = 8;
+
+          // AArch64 Advanced SIMD (NEON): 8x int16 lanes and 4x int32 lanes.
+          inline vepi16 vecLoad(const int16_t* p) noexcept { return vld1q_s16(p); }
+          inline void vecStore(int16_t* p, vepi16 v) noexcept { vst1q_s16(p, v); }
+
+          inline vepi16 vecAdd(vepi16 a, vepi16 b) noexcept { return vaddq_s16(a, b); }
+          inline vepi16 vecSub(vepi16 a, vepi16 b) noexcept { return vsubq_s16(a, b); }
+          inline vepi16 vecMin(vepi16 a, vepi16 b) noexcept { return vminq_s16(a, b); }
+          inline vepi16 vecMax(vepi16 a, vepi16 b) noexcept { return vmaxq_s16(a, b); }
+          inline vepi16 vecMullo(vepi16 a, vepi16 b) noexcept { return vmulq_s16(a, b); }
+
+          // Match x86 pmaddwd semantics.
+          inline vepi32 vecMAdd(vepi16 a, vepi16 b) noexcept {
+              const int32x4_t lo = vmull_s16(vget_low_s16(a), vget_low_s16(b));
+              const int32x4_t hi = vmull_s16(vget_high_s16(a), vget_high_s16(b));
+              return vpaddq_s32(lo, hi);
+          }
+
+          inline vepi32 vecAdd32(vepi32 a, vepi32 b) noexcept {
+              return vaddq_s32(a, b);
+          }
+
+          inline vepi16 vecSet1(int16_t x) noexcept { return vdupq_n_s16(x); }
+          inline vepi32 vecZero32() noexcept { return vdupq_n_s32(0); }
+
+          inline int32_t vecReduce(vepi32 v) noexcept {
+              return vaddvq_s32(v);
+          }
+
+          """
+
+              text = text.replace(marker, neon_block + marker, 1)
+              path.write_text(text, encoding="utf-8")
+
+          result = path.read_text(encoding="utf-8")
+
+          required = [
+              "#elif defined(__aarch64__) || defined(__ARM_NEON)",
+              "#include <arm_neon.h>",
+              "constexpr int VEC_I16 = 8;",
+              "vaddvq_s32",
+              "vpaddq_s32",
+          ]
+
+          for item in required:
+              if item not in result:
+                  raise SystemExit(f"ERROR: NEON implementation missing: {item}")
+
+          print("AArch64 NEON NNUE implementation is present.")
+          PY
+
+          echo "===== SIMD source changes ====="
+          git diff -- src/nnue/simd.h
+
+      - name: Add manual build date to UCI identity
+        shell: bash
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("src/uci/uci.cpp")
+          text = path.read_text(encoding="utf-8")
+
+          date = os.environ["UCI_DATE"]
+
+          if not (len(date) == 8 and date.isdigit()):
+              raise SystemExit("Invalid UCI build date.")
+
+          old = 'std::cout << "id name Onslaught " << version << "\\n";'
+          new = (
+              'std::cout << "id name Onslaught " << version '
+              f'<< " {date}" << "\\n";'
+          )
+
+          if text.count(old) != 1:
+              raise SystemExit(
+                  "ERROR: Expected UCI identity line was not found exactly once."
+              )
+
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding="utf-8")
+
+          if new not in text:
+              raise SystemExit("ERROR: UCI date identity patch failed.")
+
+          print(f"UCI identity will include build date {date}.")
+          PY
+
+          git diff -- src/uci/uci.cpp
+
+      - name: Verify Android NEON compiler support
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NEON_MACROS="$(
+            printf '\n' |
+              "$ANDROID_CXX" \
+                -march=armv8-a+simd \
+                -mtune=cortex-a76 \
+                -dM -E -x c++ -
+          )"
+
+          grep -q '^#define __aarch64__' <<< "$NEON_MACROS"
+          grep -q '^#define __ARM_NEON' <<< "$NEON_MACROS"
+
+          if grep -q '^#define __ARM_FEATURE_DOTPROD' <<< "$NEON_MACROS"; then
+            echo "ERROR: DotProd unexpectedly enabled in baseline NEON configuration."
+            exit 1
+          fi
+
+          echo "AArch64 compiler confirmed."
+          echo "ARM NEON compiler support confirmed."
+          echo "DotProd is not enabled."
+
+          cat > "$RUNNER_TEMP/onslaught-neon-probe.cpp" <<'CPP'
+          #include <arm_neon.h>
+
+          extern "C" int16x8_t onslaught_neon_probe(
+              int16x8_t a,
+              int16x8_t b
+          ) {
+              return vaddq_s16(a, b);
+          }
+          CPP
+
+          "$ANDROID_CXX" \
+            -O3 \
+            -march=armv8-a+simd \
+            -mtune=cortex-a76 \
+            -c "$RUNNER_TEMP/onslaught-neon-probe.cpp" \
+            -o "$RUNNER_TEMP/onslaught-neon-probe.o"
+
+          "$NDK_BIN/llvm-objdump" \
+            -d "$RUNNER_TEMP/onslaught-neon-probe.o" \
+            > "$RUNNER_TEMP/onslaught-neon-probe.txt"
+
+          if ! grep -Eiq '\badd[[:space:]]+v[0-9]+\.' \
+            "$RUNNER_TEMP/onslaught-neon-probe.txt"; then
+            echo "ERROR: NEON compiler probe did not emit vector arithmetic."
+            cat "$RUNNER_TEMP/onslaught-neon-probe.txt"
+            exit 1
+          fi
+
+          echo "NEON intrinsic compiler probe passed."
+
+      - name: Build Onslaught Android ARM64 NEON
+        shell: bash
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        run: |
+          set -euo pipefail
+
+          ENGINE_BIN="dist/Onslaught-2.1-android-arm64-neon"
+
+          mkdir -p dist
+
+          make clean
+
+          make -j2 release \
+            VERSION="$ENGINE_VERSION" \
+            CXX="$ANDROID_CXX" \
+            EVALFILE="$NNUE_FILE" \
+            EXE="$ENGINE_BIN" \
+            EXTRA_CXXFLAGS="-O3 -flto -march=armv8-a+simd -mtune=cortex-a76" \
+            EXTRA_LDFLAGS="-flto -static-libstdc++"
+
+          test -s "$ENGINE_BIN"
+
+          echo "Build completed: $ENGINE_BIN"
+          ls -lh "$ENGINE_BIN"
+
+      - name: Verify Android ARM64 ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="dist/Onslaught-2.1-android-arm64-neon"
+          READELF="$NDK_BIN/llvm-readelf"
+
+          test -s "$BIN"
+
+          echo "===== Binary information ====="
+          file "$BIN"
+
+          "$READELF" -h "$BIN" > elf-header.txt
+          "$READELF" -l "$BIN" > elf-program-headers.txt
+
+          grep -q 'Class:.*ELF64' elf-header.txt
+          grep -q 'Machine:.*AArch64' elf-header.txt
+          grep -Fq '/system/bin/linker64' elf-program-headers.txt
+
+          if "$READELF" -d "$BIN" 2>/dev/null |
+            grep -Fq 'libc++_shared.so'; then
+            echo "ERROR: Unexpected libc++_shared.so dependency."
+            exit 1
+          fi
+
+          echo "PASS: ELF64 AArch64."
+          echo "PASS: Android linker64."
+          echo "PASS: No libc++_shared.so dependency."
+
+      - name: Verify real NEON instructions in engine
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="dist/Onslaught-2.1-android-arm64-neon"
+          OBJDUMP="$NDK_BIN/llvm-objdump"
+          DISASSEMBLY="dist/onslaught-disassembly.txt"
+
+          "$OBJDUMP" -d "$BIN" > "$DISASSEMBLY"
+
+          echo "===== NEON instruction verification ====="
+
+          if ! grep -Eiq \
+            '\b(add|sub|smin|smax|mul|smull|saddp)[[:space:]]+v[0-9]+\.[0-9]+[bhsd]' \
+            "$DISASSEMBLY"; then
+            echo "ERROR: Expected Advanced SIMD instructions not found."
+            exit 1
+          fi
+
+          echo "ARM NEON vector instructions found."
+
+          if grep -Eiq '\b(sdot|udot)\b' "$DISASSEMBLY"; then
+            echo "ERROR: DotProd instructions unexpectedly found."
+            exit 1
+          fi
+
+          echo "No SDOT/UDOT instructions in this NEON-only build."
+
+          grep -Eim 10 \
+            '\b(add|sub|smin|smax|mul|smull|saddp)[[:space:]]+v[0-9]+\.' \
+            "$DISASSEMBLY" || true
+
+      - name: Verify embedded UCI build identity
+        shell: bash
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        run: |
+          set -euo pipefail
+
+          grep -Fq \
+            "std::cout << \"id name Onslaught \" << version << \" $UCI_DATE\"" \
+            src/uci/uci.cpp
+
+          grep -Fq \
+            'constexpr std::string_view version = "2.1";' \
+            src/uci/uci.h
+
+          echo "Onslaught 2.1 UCI build identity includes $UCI_DATE."
+
+      - name: Prepare engine-only artifact
+        shell: bash
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+          NETWORK_URL: ${{ inputs.network_url }}
+        run: |
+          set -euo pipefail
+
+          BIN="dist/Onslaught-2.1-android-arm64-neon"
+          STAGING="$RUNNER_TEMP/onslaught-artifact"
+
+          mkdir -p "$STAGING"
+
+          cp "$BIN" "$STAGING/Onslaught"
+          cp network.sha256 "$STAGING/nnue-network.sha256"
+
+          (
+            cd "$STAGING"
+            sha256sum Onslaught > SHA256SUMS.txt
+          )
+
+          cat > "$STAGING/build-info.txt" <<EOF
+          Engine: Onslaught
+          Version: ${ENGINE_VERSION}
+          UCI build date: ${UCI_DATE}
+          Target: Android
+          ABI: arm64-v8a
+          Android API: ${ANDROID_API}
+          NDK: ${NDK_VERSION} (${NDK_REVISION})
+          Architecture: ARMv8-A NEON
+          Compiler flags: -march=armv8-a+simd -mtune=cortex-a76
+          NNUE: ${NNUE_FILE}
+          NNUE URL: ${NETWORK_URL}
+          NEON implementation: AArch64 Advanced SIMD intrinsics
+          DotProd: not enabled
+          Source snapshot: 7da5ec6fc2db340f8954e910871fb78baadf97f0
+          NEON implementation reference: 216026013af688b55e435e63f60b88b3ca24188
+          Workflow checkout: ${GITHUB_SHA}
+          EOF
+
+          echo "===== Artifact contents ====="
+          ls -lh "$STAGING"
+
+          {
+            echo "### Build result"
+            echo "- Engine: Onslaught ${ENGINE_VERSION}"
+            echo "- UCI date: ${UCI_DATE}"
+            echo "- Architecture: ARM64 NEON"
+            echo "- NNUE: ${NNUE_FILE}"
+            echo "- Artifact: Onslaught-2.1-Android-ARM64-NEON"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Android ARM64 NEON engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: Onslaught-2.1-Android-ARM64-NEON-${{ inputs.uci_date }}
+          path: ${{ runner.temp }}/onslaught-artifact/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 9
